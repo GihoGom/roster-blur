@@ -1,5 +1,5 @@
 // 오프라인 사용: 앱 파일만 캐시한다. 사진은 다루지 않는다.
-const CACHE = "roster-blur-v1";
+const CACHE = "roster-blur-v2";
 const FILES = ["./", "./index.html", "./manifest.webmanifest", "./icon.svg"];
 
 self.addEventListener("install", e => {
