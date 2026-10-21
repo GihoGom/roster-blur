@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 사진은 이 페이지 밖으로 나가지 않는다: 외부 연결 전부 차단 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'none'; form-action 'none'">
+<title>명단 가리기</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg">
+<meta name="theme-color" content="#2457c5">
+<style>
+  :root { --bg: #f4f4f2; --fg: #1b1b1b; --card: #fff; --line: #d6d6d2; --accent: #2457c5; --muted: #6b6b6b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161616; --fg: #ececec; --card: #222; --line: #3a3a3a; --accent: #7aa2ff; --muted: #9a9a9a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, "Malgun Gothic", sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 4px; }
+  p.sub { margin: 0 0 16px; color: var(--muted); font-size: 14px; }
+  .pick { display: block; width: 100%; padding: 18px; border: 2px dashed var(--line); border-radius: 12px; background: var(--card);
+          text-align: center; font-size: 17px; font-weight: 600; color: var(--accent); cursor: pointer; }
+  .pick input { display: none; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-top: 16px; }
+  .card canvas { width: 100%; height: auto; display: block; border-radius: 6px; }
+  .msg { font-size: 14px; margin: 8px 0; }
+  .msg.err { color: #c62828; font-weight: 600; }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  .row button { flex: 1; padding: 14px; font-size: 16px; font-weight: 600; border-radius: 10px; border: 1px solid var(--line);
+                background: var(--card); color: var(--fg); cursor: pointer; }
+  .row button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .hint { font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>명단 가리기</h1>
+  <p class="sub">가이드·기사 칸과 팩스 발신자 줄을 가립니다. 사진은 이 기기 밖으로 나가지 않습니다.</p>
+  <label class="pick">사진 선택 (여러 장 가능)<input id="file" type="file" accept="image/*" multiple></label>
+  <div id="out"></div>
+</main>
+<script>
+"use strict";
+const AW = 1200;              // 분석용 가로 크기
+const FILL = "#d9d9d9";
+
+// ---------- 이미지 처리 ----------
+function loadImage(src) {
+  return new Promise((ok, fail) => {
+    const img = new Image();
+    img.onload = () => ok(img);
+    img.onerror = fail;
+    img.src = src;
+  });
+}
+
+function toCanvas(img, maxDim = 2600) {
+  const k = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+  const c = document.createElement("canvas");
+  c.width = Math.round(img.naturalWidth * k);
+  c.height = Math.round(img.naturalHeight * k);
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  return c;
+}
+
+// 검은 잉크만 true. 빨간 손글씨·형광펜은 제외.
+function darkMask(canvas) {
+  const w = AW, h = Math.round(canvas.height * AW / canvas.width);
+  const t = document.createElement("canvas");
+  t.width = w; t.height = h;
+  const ctx = t.getContext("2d");
+  ctx.drawImage(canvas, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const gray = new Uint8Array(w * h), red = new Uint8Array(w * h);
+  const hist = new Array(256).fill(0);
+  for (let i = 0, p = 0; i < w * h; i++, p += 4) {
+    const r = d[p], g = d[p + 1], b = d[p + 2];
+    const v = (r * 299 + g * 587 + b * 114) / 1000 | 0;
+    gray[i] = v; hist[v]++;
+    red[i] = (r - g > 45 && r - b > 25) || (b - g > 45 && r - g > 25) ? 1 : 0;
+  }
+  const th = Math.min(otsu(hist, w * h), 150);
+  const m = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) m[i] = gray[i] < th && !red[i] ? 1 : 0;
+  return { m, w, h };
+}
+
+function otsu(hist, n) {
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sB = 0, wB = 0, best = 0, th = 128;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (!wB) continue;
+    const wF = n - wB; if (!wF) break;
+    sB += i * hist[i];
+    const mB = sB / wB, mF = (sum - sB) / wF;
+    const v = wB * wF * (mB - mF) ** 2;
+    if (v > best) { best = v; th = i; }
+  }
+  return th;
+}
+
+// 가로줄이 가장 선명해지는 각도(도)
+function skewAngle({ m, w, h }) {
+  const pts = [];
+  for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) if (m[y * w + x]) pts.push(x, y);
+  const score = a => {
+    const s = Math.sin(a * Math.PI / 180), c = Math.cos(a * Math.PI / 180);
+    const bins = new Float64Array(h * 2);
+    for (let i = 0; i < pts.length; i += 2) {
+      const y = Math.round(pts[i + 1] * c - pts[i] * s) + (h >> 1);
+      if (y >= 0 && y < bins.length) bins[y]++;
+    }
+    let v = 0; for (const b of bins) v += b * b; return v;
+  };
+  let best = 0, bs = -1;
+  for (let a = -5; a <= 5; a += 0.25) { const v = score(a); if (v > bs) { bs = v; best = a; } }
+  const base = best;
+  for (let a = base - 0.25; a <= base + 0.25; a += 0.05) { const v = score(a); if (v > bs) { bs = v; best = a; } }
+  return best;
+}
+
+function rotate(canvas, deg) {
+  if (Math.abs(deg) < 0.05) return canvas;
+  const c = document.createElement("canvas");
+  c.width = canvas.width; c.height = canvas.height;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.translate(c.width / 2, c.height / 2);
+  ctx.rotate(-deg * Math.PI / 180);
+  ctx.drawImage(canvas, -c.width / 2, -c.height / 2);
+  return c;
+}
+
+// 끊김(gap) 허용한 가장 긴 연속 구간
+function longestRun(get, n, gap) {
+  let best = [0, 0, 0], start = -1, last = -1;
+  for (let i = 0; i < n; i++) {
+    if (!get(i)) continue;
+    if (start < 0 || i - last > gap + 1) {
+      if (start >= 0 && last - start > best[0]) best = [last - start, start, last];
+      start = i;
+    }
+    last = i;
+  }
+  if (start >= 0 && last - start > best[0]) best = [last - start, start, last];
+  return best; // [길이, 시작, 끝]
+}
+
+// 가로선: 위아래 2px 여유를 두고 긴 연속 구간이 있는 행 (종이 휨 대응)
+function hLines({ m, w, h }) {
+  const any = (x, y) => {
+    for (let d = -2; d <= 2; d++) { const yy = y + d; if (yy >= 0 && yy < h && m[yy * w + x]) return 1; }
+    return 0;
+  };
+  const out = [];
+  for (let y = 0; y < h; y++) {
+    const [len] = longestRun(x => any(x, y), w, 12);
+    if (len <= w * 0.35) continue;
+    const g = out[out.length - 1];
+    if (g && y - g.last <= 4) { if (len > g.len) { g.y = y; g.len = len; } g.last = y; }
+    else out.push({ y, len, last: y });
+  }
+  return out;
+}
+
+// x 범위 안에서 선의 실제 y
+function localY({ m, w, h }, y, x0, x1) {
+  let best = y, bs = -1;
+  for (let yy = Math.max(0, y - 10); yy <= Math.min(h - 1, y + 10); yy++) {
+    let n = 0; for (let x = x0; x < x1; x++) n += m[yy * w + x];
+    if (n > bs) { bs = n; best = yy; }
+  }
+  return best;
+}
+
+// 한 행 안의 세로선 x 위치들
+function vPeaks({ m, w }, y0, y1) {
+  const a = Math.round(y0) + 5, b = Math.round(y1) - 5, n = b - a;
+  if (n < 6) return [];
+  const out = [];
+  for (let x = 1; x < w - 1; x++) {
+    let hit = 0;
+    for (let y = a; y < b; y++) { const i = y * w + x; hit += m[i] | m[i - 1] | m[i + 1]; }
+    if (hit <= n * 0.7) continue;
+    const g = out[out.length - 1];
+    if (g && x - g[g.length - 1] <= 2) g.push(x); else out.push([x]);
+  }
+  return out.map(g => (g[0] + g[g.length - 1]) / 2);
+}
+
+// 표 세로선 위치(왼쪽 테두리 0, 오른쪽 테두리 1). 양식이 고정이라 비율이 늘 같다.
+// No|상품세부|버스|단축명|호차|인원|가이드|기사|승차장소|비고
+const TPL = [0, .0287, .1198, .1889, .3500, .4002, .4484, .6091, .7683, .8793, 1];
+const GUIDE = [6, 7, 8]; // 가이드 시작, 기사 시작, 승차장소 시작
+
+// 한 행의 세로선들을 템플릿에 맞춰 왼쪽 위치(L)와 표 폭(tw)을 추정
+function fitRow(peaks, w) {
+  let best = { n: 0 };
+  for (let i = 0; i < peaks.length; i++)
+    for (let j = i + 1; j < peaks.length; j++)
+      for (let a = 0; a < TPL.length; a++)
+        for (let b = a + 1; b < TPL.length; b++) {
+          const tw = (peaks[j] - peaks[i]) / (TPL[b] - TPL[a]);
+          if (tw < w * 0.5 || tw > w * 1.02) continue;
+          const L = peaks[i] - tw * TPL[a], tol = tw * 0.012;
+          let n = 0;
+          for (const f of TPL) if (peaks.some(p => Math.abs(p - (L + tw * f)) < tol)) n++;
+          if (n > best.n) best = { n, L, tw };
+        }
+  return best;
+}
+
+// 템플릿 위치 근처에 실제 선이 있으면 그 위치를, 없으면 템플릿 위치를 쓴다
+function colsFrom(fit, peaks) {
+  return GUIDE.map(k => {
+    const want = fit.L + fit.tw * TPL[k];
+    const near = peaks.length ? peaks.reduce((p, c) => Math.abs(c - want) < Math.abs(p - want) ? c : p) : want;
+    return Math.abs(near - want) < fit.tw * 0.012 ? near : want;
+  });
+}
+
+function analyze(mask) {
+  const { w } = mask;
+  const lines = hLines(mask);
+  if (lines.length < 3) return { error: "표의 가로선을 찾지 못했습니다" };
+  for (const l of lines) l.yg = localY(mask, l.y, Math.round(w * 0.45), Math.round(w * 0.75));
+
+  const rows = [];
+  for (let i = 0; i + 1 < lines.length; i++) {
+    const y0 = lines[i].yg, y1 = lines[i + 1].yg;
+    if (y1 - y0 < 15) continue;
+    const peaks = vPeaks(mask, y0, y1).filter(x => x > 5 && x < w - 5);
+    rows.push({ y0, y1, peaks, fit: fitRow(peaks, w) });
+  }
+  const first = rows.findIndex(r => r.fit.n >= 6);      // 표 머리글(No, 상품세부 …)
+  let last = -1; rows.forEach((r, i) => { if (r.fit.n >= 4) last = i; });
+  if (first < 0 || last <= first) return { error: "가이드·기사 칸을 찾지 못했습니다" };
+
+  // 팩스 잡음 줄이 한 행을 둘로 나눈 경우 다시 합치기
+  const body = rows.slice(first + 1, last + 1);
+  const med = [...body.map(r => r.y1 - r.y0)].sort((p, q) => p - q)[body.length >> 1];
+  for (let i = 0; i < body.length; i++) {
+    const r = body[i];
+    if (r.y1 - r.y0 >= med * 0.65 || body.length < 2) continue;
+    const prev = body[i - 1], next = body[i + 1];
+    const j = !prev ? i + 1 : !next ? i - 1 : (prev.y1 - prev.y0 < next.y1 - next.y0 ? i - 1 : i + 1);
+    const a = body[Math.min(i, j)], b = body[Math.max(i, j)];
+    const peaks = [...a.peaks, ...b.peaks].sort((p, q) => p - q);
+    body.splice(Math.min(i, j), 2, { y0: a.y0, y1: b.y1, peaks, fit: a.fit.n >= b.fit.n ? a.fit : b.fit });
+    i = Math.max(-1, Math.min(i, j) - 1);
+  }
+
+  const items = [];
+  let fit = rows[first].fit;
+  for (const r of body) {
+    // 윗행과 크게 어긋나는 추정(손글씨 동그라미 등)은 버린다
+    if (r.fit.n >= 4 && Math.abs(r.fit.L - fit.L) < fit.tw * 0.02 && Math.abs(r.fit.tw - fit.tw) < fit.tw * 0.02) fit = r.fit;
+    // 합계 행: 앞쪽 칸과 가이드|기사 칸 구분선이 모두 없음
+    const has = k => r.peaks.some(p => Math.abs(p - (fit.L + fit.tw * TPL[k])) < fit.tw * 0.012);
+    const total = !has(1) && !has(2) && !has(7);
+    items.push(cell(mask, r, colsFrom(fit, r.peaks), total));
+  }
+  // 바로 아래 합계 행(가이드·기사 칸이 합쳐진 행)도 덮기
+  const nx = rows[last + 1];
+  if (nx && nx.y0 - rows[last].y1 < 4 && nx.peaks.length) items.push(cell(mask, nx, colsFrom(fit, nx.peaks), true));
+
+  // 팩스 발신자 줄: 세로선이 있는 첫 칸(출발일자 상자 또는 표 머리글) 위쪽 전체
+  const topRow = rows.find(r => r.peaks.length >= 4) || rows[first];
+  return { pageTop: topRow.y0, header: rows[first], items };
+}
+
+function cell(mask, r, xs, merged) {
+  const [x6, x7, x8] = xs;
+  return {
+    y0: r.y0, y1: r.y1, x6, x7, x8, merged,
+    guide: !merged && inked(mask, x6, x7, r.y0, r.y1),
+    driver: !merged && inked(mask, x7, x8, r.y0, r.y1),
+  };
+}
+
+function inked({ m, w }, x0, x1, y0, y1) {
+  const ix = 6, iy = 5;
+  let n = 0, area = 0;
+  for (let y = Math.round(y0 + iy); y < y1 - iy; y++)
+    for (let x = Math.round(x0 + ix); x < x1 - ix; x++) { n += m[y * w + x]; area++; }
+  return area > 0 && n > Math.max(25, area * 0.012);
+}
+
+// ---------- 그리기 ----------
+function render(base, info, out) {
+  const k = base.width / AW;
+  out.width = base.width; out.height = base.height;
+  const ctx = out.getContext("2d");
+  ctx.drawImage(base, 0, 0);
+  const X = v => v * k;
+
+  // 팩스 발신자 줄(첫 가로선 위 전체)
+  ctx.fillStyle = FILL;
+  ctx.fillRect(0, 0, out.width, Math.max(0, X(info.pageTop - 12)));
+
+  // 가이드·기사 칸: 행마다 위아래로 넉넉히 덮기
+  for (const r of info.items) {
+    ctx.fillStyle = FILL;
+    ctx.fillRect(X(r.x6) + 2, X(r.y0) - 4, X(r.x8) - X(r.x6) - 4, X(r.y1) - X(r.y0) + 8);
+  }
+  ctx.strokeStyle = "#000"; ctx.lineWidth = Math.max(2, k * 1.5);
+  const fs = Math.max(12, Math.min(X(15), ...info.items.map(r => X(r.y1 - r.y0) * 0.42)));
+  ctx.font = `bold ${fs}px "Malgun Gothic", sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const r of info.items) {
+    for (const y of [r.y0, r.y1]) { ctx.beginPath(); ctx.moveTo(X(r.x6), X(y)); ctx.lineTo(X(r.x8), X(y)); ctx.stroke(); }
+    if (r.merged) continue;
+    ctx.beginPath(); ctx.moveTo(X(r.x7), X(r.y0)); ctx.lineTo(X(r.x7), X(r.y1)); ctx.stroke();
+    const cy = X((r.y0 + r.y1) / 2);
+    label(ctx, r.guide ? "가이드 있음" : "가이드 공란", X((r.x6 + r.x7) / 2), cy, r.guide);
+    label(ctx, r.driver ? "기사 있음" : "기사 공란", X((r.x7 + r.x8) / 2), cy, r.driver);
+  }
+}
+
+function label(ctx, text, x, y, on) {
+  ctx.fillStyle = on ? "#000" : "#b00000";
+  ctx.fillText(text, x, y);
+}
+
+// ---------- 화면 ----------
+const out = document.getElementById("out");
+let seq = 0;
+window.__results = [];
+
+document.getElementById("file").addEventListener("change", async e => {
+  for (const f of e.target.files) await processSrc(URL.createObjectURL(f), f.name);
+  e.target.value = "";
+});
+
+async function processSrc(src, name) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `<div class="msg">처리 중…</div>`;
+  out.prepend(card);
+  try {
+    const img = await loadImage(src);
+    let base = toCanvas(img);
+    const angle = skewAngle(darkMask(base));
+    base = rotate(base, angle);
+    const info = analyze(darkMask(base));
+    window.__results.push({ name, angle, info });
+    if (info.error) {
+      card.innerHTML = `<div class="msg err">${info.error}. 표 전체가 화면에 들어오게, 바르게 다시 찍어 주세요.</div>`;
+      return;
+    }
+    show(card, base, info, name);
+  } catch (err) {
+    card.innerHTML = `<div class="msg err">사진을 열 수 없습니다: ${err}</div>`;
+  }
+}
+
+function show(card, base, info, name) {
+  const n = info.items.filter(r => !r.merged).length;
+  card.innerHTML = `
+    <div class="msg">${n}행 인식 · 가이드 공란 <b class="gb"></b>건</div>
+    <p class="hint">가이드/기사 표시가 틀렸으면 그 칸을 눌러서 바꾸세요. 저장하기 전에 가려지지 않은 이름이 없는지 꼭 확인하세요.</p>
+    <canvas></canvas>
+    <div class="row"><button class="save primary">갤러리에 저장</button><button class="share">공유</button></div>`;
+  const cv = card.querySelector("canvas");
+  const draw = () => {
+    render(base, info, cv);
+    card.querySelector(".gb").textContent = info.items.filter(r => !r.merged && !r.guide).length;
+  };
+  draw();
+
+  cv.addEventListener("click", e => {
+    const rect = cv.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width * AW;
+    const y = (e.clientY - rect.top) / rect.height * (AW * cv.height / cv.width);
+    const r = info.items.find(r => !r.merged && y > r.y0 && y < r.y1);
+    if (!r) return;
+    if (x > r.x6 && x < r.x7) r.guide = !r.guide;
+    else if (x > r.x7 && x < r.x8) r.driver = !r.driver;
+    else return;
+    draw();
+  });
+
+  const fname = "명단_" + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "") + "_" + (++seq) + ".jpg";
+  const blob = () => new Promise(ok => cv.toBlob(ok, "image/jpeg", 0.9));
+  card.querySelector(".save").onclick = async () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(await blob());
+    a.download = fname;
+    a.click();
+  };
+  const share = card.querySelector(".share");
+  share.onclick = async () => {
+    const file = new File([await blob()], fname, { type: "image/jpeg" });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file] });
+    else alert("이 브라우저는 공유를 지원하지 않습니다. 저장 후 올려 주세요.");
+  };
+}
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+
+// 테스트용: ?img=test/4.webp
+const q = new URLSearchParams(location.search).get("img");
+if (q) q.split(",").forEach(s => processSrc(s, s));
+</script>
+</body>
+</html>

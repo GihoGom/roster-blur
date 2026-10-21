@@ -1,0 +1,9 @@
+{
+  "name": "명단 가리기",
+  "short_name": "명단가리기",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f4f4f2",
+  "theme_color": "#2457c5",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
